@@ -136,17 +136,26 @@ train(model, loss, optimizer, scheduler, 50, device, train_dataloader, val_datal
 
 model.eval()
 
-class ImageFolderWithPaths(datasets.ImageFolder):
+class TestDataset(Dataset):
 
-    def __getitem__(self, index):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.image_names = [f for f in os.listdir(root_dir) 
+                            if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
-        original_tuple = super(ImageFolderWithPaths, self).__getitem__(index)
-        path = self.imgs[index][0]
-        tuple_with_path = (original_tuple + (path,))
-        return tuple_with_path
+    def __len__(self):
+        return len(self.image_names)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.root_dir, self.image_names[idx])
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        return image, 0, img_path
 
 test_path = os.path.join(extract_path, 'plates', 'test') 
-test_dataset = ImageFolderWithPaths(test_path, transform)
+test_dataset = TestDataset(test_path, transform)
 
 test_dataloader = torch.utils.data.DataLoader(
     test_dataset, batch_size=b_size, shuffle=False, num_workers=0)
@@ -158,7 +167,7 @@ model.to(device)
 for inputs, labels, paths in tqdm(test_dataloader):
     inputs = inputs.to(device)
     labels = labels.to(device)
-    with torch.set_grad_enabled(False):
+    with torch.no_grad():
         preds = model(inputs)
     test_predictions.append(
         torch.nn.functional.softmax(preds, dim=1)[:,1].data.cpu().numpy())
@@ -172,4 +181,230 @@ submission_df['id'] = submission_df['id'].apply(lambda x: os.path.splitext(os.pa
 submission_df['label'] = submission_df['label'].map(lambda pred: 'dirty' if pred > 0.5 else 'cleaned')
 
 submission_df.set_index('id', inplace=True)
+
 print(submission_df.head(n=6))
+
+submission_df.to_csv("./LAB2/SIMPLE_TRY/submission_simple.csv")
+
+###
+
+# Результат плохой. Применим трансферное обучение. Трансферное обучение - берем предобученную нейронную сеть
+# и обучаем только полносвязный
+
+###
+
+train_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+]
+)
+
+val_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+]
+)
+
+train_dataset = datasets.ImageFolder(train_dir, train_transform)
+val_dataset = datasets.ImageFolder(val_dir, val_transform)
+
+batch_size = 2
+train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
+
+model = models.resnet18(pretrained = True)
+
+for param in model.parameters():
+    param.requires_grad = False
+
+model.fc = torch.nn.Linear(model.fc.in_features, 2)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+loss = torch.nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), 1e-3)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+
+num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f'Обучаемые параметры модели {num_params:,}')
+
+train(model, loss, optimizer, scheduler, 50, "cuda", train_dataloader, val_dataloader)
+
+test_path = os.path.join(extract_path, 'plates', 'test') 
+test_dataset = TestDataset(test_path, val_transform)
+
+test_dataloader = torch.utils.data.DataLoader(
+    test_dataset, batch_size=b_size, shuffle=False)
+
+model.eval()
+
+test_predictions = []
+test_img_paths = []
+
+model.to(device)
+for inputs, labels, paths in tqdm(test_dataloader):
+    inputs = inputs.to(device)
+    labels = labels.to(device)
+    with torch.no_grad():
+        preds = model(inputs)
+    test_predictions.append(
+        torch.nn.functional.softmax(preds, dim=1)[:,1].data.cpu().numpy())
+    test_img_paths.extend(paths)
+
+test_predictions = np.concatenate(test_predictions)
+
+submission_df = pd.DataFrame.from_dict({'id': test_img_paths, 'label': test_predictions})
+
+submission_df['id'] = submission_df['id'].apply(lambda x: os.path.splitext(os.path.basename(x))[0])
+submission_df['label'] = submission_df['label'].map(lambda pred: 'dirty' if pred > 0.5 else 'cleaned')
+
+submission_df.set_index('id', inplace=True)
+
+print(submission_df.head(n=6))
+
+submission_df.to_csv("./LAB2/PRETRAINED_TRY/submission_pretrained.csv")
+
+###
+
+# Точность составила 74 процента
+
+###
+
+# Так как примеров мало, необходимо увеличить их число. Воспользуемся техникой аугментации данных
+
+train_transforms = [
+    transforms.Compose([
+    transforms.CenterCrop(200),
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]),
+
+    transforms.Compose([
+    transforms.CenterCrop(200),
+    transforms.Resize((224,224)),
+    transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.2),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]),
+
+    transforms.Compose([
+    transforms.CenterCrop(200),
+    transforms.Resize((224,224)),
+    transforms.RandomOrder([
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomVerticalFlip(),
+        ]),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]),
+
+    transforms.Compose([
+    transforms.CenterCrop(200),
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]),
+
+    transforms.Compose([
+    transforms.RandomRotation(45),
+    transforms.CenterCrop(200),
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]),
+
+    transforms.Compose([
+    transforms.CenterCrop(200),
+    transforms.Resize((224,224)),
+    transforms.RandomGrayscale(p=1),
+    transforms.RandomOrder([
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomVerticalFlip(),
+        ]),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]),
+
+    transforms.Compose([
+    transforms.CenterCrop(200),
+    transforms.Resize((224,224)),
+    transforms.ColorJitter(brightness=0.2, contrast=0.4, saturation=0.4, hue=0.4),
+    transforms.RandomVerticalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+]
+
+val_transforms = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+train_dataset = torch.utils.data.ConcatDataset([
+    datasets.ImageFolder(train_dir, train_transform)
+    for train_transform in train_transforms])
+
+val_dataset = datasets.ImageFolder(val_dir, val_transforms)
+
+train_dataloader = torch.utils.data.DataLoader(
+    train_dataset, batch_size=batch_size, shuffle=True)
+
+
+val_dataloader = torch.utils.data.DataLoader(
+    val_dataset, batch_size=batch_size, shuffle=True)
+
+model = models.resnet18(pretrained = True)
+
+for param in model.parameters():
+    param.requires_grad = False
+
+for param in model.layer4.parameters():
+    param.requires_grad = True
+
+model.fc = torch.nn.Linear(model.fc.in_features, 2)
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+
+loss = torch.nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), 1e-3)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size = 7, gamma = 0.1)
+
+num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f'Обучаемые параметры модели {num_params:,}')
+assert(num_params == 8394754)
+
+train(model, loss, optimizer, scheduler, 50, "cuda", train_dataloader, val_dataloader)
+
+test_dataset = TestDataset(test_path, val_transform)
+test_dataloader = torch.utils.data.DataLoader(
+    test_dataset, batch_size=b_size, shuffle=False
+)
+
+model.eval()
+
+test_predictions = []
+test_img_paths = []
+
+model.to(device)
+for inputs, labels, paths in tqdm(test_dataloader):
+    inputs = inputs.to(device)
+    labels = labels.to(device)
+    with torch.no_grad():
+        preds = model(inputs)
+    test_predictions.append(
+        torch.nn.functional.softmax(preds, dim=1)[:,1].data.cpu().numpy())
+    test_img_paths.extend(paths)
+
+test_predictions = np.concatenate(test_predictions)
+
+submission_df = pd.DataFrame.from_dict({'id': test_img_paths, 'label': test_predictions})
+
+submission_df['id'] = submission_df['id'].apply(lambda x: os.path.splitext(os.path.basename(x))[0])
+submission_df['label'] = submission_df['label'].map(lambda pred: 'dirty' if pred > 0.5 else 'cleaned')
+
+submission_df.set_index('id', inplace=True)
+
+print(submission_df.head(n=6))
+
+submission_df.to_csv("./LAB2/PRETRAINED_AUGMENTATION_TRY/submission_pretrained_augmentation.csv")
+
